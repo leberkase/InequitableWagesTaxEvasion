@@ -1,0 +1,253 @@
+---
+title: Tax Compliance Experiment
+output:
+  html_document:
+    toc: true
+---
+
+
+```{r setup}
+library(VGAM)
+library(stargazer)
+library(mediation)
+library(tidyverse)
+library(ggpubr)
+library(simpleboot)
+library(furrr)
+library(gamlss)
+
+set.seed(2323)
+
+
+knitr::opts_chunk$set(
+  fig.width = 11,
+  fig.height = 8.5
+)
+
+
+data_with_inattentive <- foreign::read.spss("inequityTaxEvasionDataset_FINAL.sav", to.data.frame = TRUE) %>%
+  filter(test == 0,
+         participant.id_in_session > 1) %>%
+  mutate(Wage = forcats::fct_recode(lowWage, Unequal = "1500", Equal = "3000"),
+         Intent = forcats::fct_recode(intent, Nature = "nature", Intent = "intent")) %>%
+  mutate(Wage = factor(Wage, levels = c("Equal", "Unequal"))) %>%
+  dplyr::select(compliance, Intent, Wage, male, scl.1.player.lottery_choice, estimate01, attencheckPassed) %>%
+  mutate(complianceType = case_when( compliance == 0 ~ "zero",
+                                    compliance == 1 ~ "full",
+                                    TRUE ~ "partial") ) %>%
+  mutate(complianceType = factor(complianceType, levels=c("zero", "partial", "full"))) %>%
+  droplevels()
+
+
+data <- data_with_inattentive %>%
+  filter(attencheckPassed==1)
+
+data_without_riskseekers <- data %>%
+  filter(scl.1.player.lottery_choice != 6)
+
+
+theme_set(theme_pubr())
+```
+
+
+```{r histogram}
+
+summaries <- data %>%
+  pivot_longer( c(compliance, estimate01)) %>%
+  group_by(Intent, Wage, name) %>%
+  summarize_at(vars(value), funs(mean, sd)) %>%
+  mutate(note = paste0("Mean (SD) = ", round(mean, 3), " (", round(sd, 3), ")"))
+
+summary_notes <- summaries %>%
+  select(-mean, -sd) %>%
+  pivot_wider(names_from = name, values_from = note)
+
+
+ggplot(data, aes(x = compliance)) +
+  geom_histogram(aes(y = ..density..), binwidth = 0.1) +
+  facet_grid(Intent ~ Wage) +
+  geom_text(aes(label = compliance), x = 0.5, y = 6.5, data = summary_notes) + 
+  scale_x_continuous(name = "Compliance", breaks = seq(0, 1, .1)) +
+  scale_y_continuous(name = "Percent", breaks = 0:7, labels = as.character(seq(0, 70, 10))) +
+  theme_pubr()
+
+ggsave("compliance-histogram.pdf")
+
+ggplot(data, aes(x = estimate01)) +
+  geom_histogram(aes(y = ..density..), binwidth = 0.1) +
+  facet_grid(Intent ~ Wage) +
+  geom_text(aes(label = estimate01), x = 0.45, y = 2.5, data = summary_notes) + 
+  scale_x_continuous(name = "Beliefs", breaks = seq(0, 1, .1)) +
+  scale_y_continuous(name = "Percent", breaks = 0:7, labels = as.character(seq(0, 70, 10)), limits = c(0, 3))
+
+ggsave("beliefs-histogram.pdf")
+
+
+
+
+```
+
+
+# Compliance
+
+## Zero-one Inflated Beta Regressions
+
+### Intent*Wage
+```{r beinf_base}
+
+beinf_base <- gamlss( compliance ~ Intent*Wage,
+                     nu.formula = ~ Intent*Wage,
+                     tau.formula = ~ Intent*Wage,
+                     data=data, family=BEINF)
+summary(beinf_base)
+```
+
+### add beliefs
+```{r beinf_beliefs}
+
+beinf_beliefs <- gamlss( compliance ~ Intent*Wage  + estimate01,
+                        nu.formula = ~ Intent*Wage + estimate01,
+                        tau.formula = ~ Intent*Wage + estimate01,
+                        data=data, family = BEINF)
+summary(beinf_beliefs)
+```
+
+
+### add male
+```{r beinf_male}
+
+beinf_male <- gamlss( compliance ~ Intent*Wage  + estimate01 + male,
+                     nu.formula =  ~ Intent*Wage  + estimate01 + male,
+                     tau.formula =  ~ Intent*Wage  + estimate01 + male,
+                     data=data, family=BEINF)
+summary(beinf_male)
+```
+
+
+### add risk
+```{r beinf_risk}
+
+beinf_risk <- gamlss( compliance ~ Intent*Wage  + estimate01 + male + scl.1.player.lottery_choice,
+                     nu.formula = ~ Intent*Wage  + estimate01 + male + scl.1.player.lottery_choice,
+                     tau.formula = ~ Intent*Wage  + estimate01 + male + scl.1.player.lottery_choice,
+                     data=data, family=BEINF)
+summary(beinf_risk)
+```
+
+
+
+
+
+## Tobit
+
+### Intent*Wage
+```{r tobit_base}
+
+tobit_base <- vglm( compliance ~ Intent*Wage, tobit(Lower = 0, Upper = 1), data=data)
+summary(tobit_base)
+lrtest(tobit_base)
+```
+
+
+### add beliefs
+```{r tobit_beliefs}
+
+tobit_beliefs <- vglm( compliance ~ Intent*Wage + estimate01, tobit(Lower = 0, Upper = 1), data=data)
+summary(tobit_beliefs)
+lrtest(tobit_beliefs)
+```
+
+
+### add male
+```{r tobit_male}
+
+tobit_male <- vglm( compliance ~ Intent*Wage + estimate01 + male, tobit(Lower = 0, Upper = 1), data=data)
+summary(tobit_male)
+lrtest(tobit_male)
+```
+
+
+### add risk
+```{r tobit_risk}
+
+tobit_risk <- vglm( compliance ~ Intent*Wage + estimate01 + male + scl.1.player.lottery_choice, tobit(Lower = 0, Upper = 1), data=data, vglm.control = vglm.control(maxit = 100), model = TRUE, x.arg=TRUE, y.arg=TRUE)
+summary(tobit_risk)
+lrtest(tobit_risk)
+```
+
+
+
+
+
+## Estimated Marginal Means
+```{r emm_compliance}
+compliance_grid <- data %>%
+  group_by(Intent, Wage) %>%
+  summarize(estimate01 = mean(estimate01)) %>%
+  arrange(Intent, Wage, estimate01)
+
+
+compliance_boot_stat <- function(.data, .idx, .grid) {
+  boot_data <- .data[.idx, ]
+  boot_data %>%
+    group_by(Intent, Wage) %>%
+    summarize(y = mean(compliance)) %>%
+    right_join(.grid) %>%
+    arrange(Intent, Wage, estimate01) %>%
+    pull(y)
+
+}
+
+
+compliance_boot <- boot::boot(data,
+                 compliance_boot_stat,
+                 R = 2000,
+                 strata = with(data, interaction(Intent, Wage)),
+                 .grid = compliance_grid,
+                 parallel = "multicore",
+                 ncpus = 8
+                 )
+
+
+cis <- 1:4 %>%
+  purrr::map(~boot::boot.ci(compliance_boot, index = ., type = "bca")$bca) %>%
+  rlang::flatten_dbl() %>%
+  matrix(byrow = TRUE, ncol = 5) %>%
+  `[`(,4:5)
+
+
+colnames(cis) <- c("lower", "upper")
+
+
+compliance_emm <- compliance_grid %>%
+  group_by(Intent, Wage) %>%
+  tally() %>%
+  bind_cols( mean = compliance_boot$t0) %>%
+  bind_cols(data.frame(cis))
+
+compliance_emm
+  
+```
+
+
+
+
+
+# Beliefs
+
+
+
+
+## Tobit Regressions
+
+### Intent*Wage
+```{r beliefs_base_tobit}
+beliefs_base_tobit <- vglm( estimate01 ~ Intent*Wage, tobit(Lower = 0, Upper = 1), data=data)
+summary(beliefs_base_tobit)
+lrtest(beliefs_base_tobit)
+```
+
+
+
+
+
